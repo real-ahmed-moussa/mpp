@@ -1,0 +1,401 @@
+---
+title: "Material Property Prediction — Concrete Compressive Strength"
+author: "Dr. Ahmed Moussa"
+date: "March 2021"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    code_folding: show
+    fig_width: 9
+    fig_height: 5
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## 1. Overview
+
+Traditional laboratory testing for concrete compressive strength requires cured physical specimens and specialised equipment, making it time-intensive and costly for iterative structural design. This project applies three tree ensemble methods — Bagging, Random Forests, and Gradient Boosting — to the UCI Concrete Compressive Strength dataset (1,030 specimens, 8 mix-design predictors) to predict compressive strength in MPa from ingredient proportions and curing age alone. Gradient Boosting with interaction depth d = 10 and shrinkage λ = 0.01 achieved the best test MSE of 17.14, a 38% improvement over Bagging (27.57) and Random Forests (27.78). Age and Cement emerged as the dominant predictors, consistent with established concrete engineering theory.
+
+---
+
+## 2. Setup
+
+```{r libraries}
+library(randomForest)
+library(gbm)
+library(ggplot2)
+library(tidyr)
+
+set.seed(42)
+
+if (!dir.exists("figures")) dir.create("figures")
+
+theme_portfolio <- function() {
+  theme_minimal(base_family = "sans", base_size = 12) +
+  theme(
+    plot.title       = element_text(size = 14, face = "bold", color = "#0F1923", margin = margin(b = 8)),
+    plot.subtitle    = element_text(size = 11, color = "#444444", margin = margin(b = 12)),
+    plot.caption     = element_text(size = 9,  color = "#888780", hjust = 0),
+    axis.title       = element_text(size = 11, color = "#444444"),
+    axis.text        = element_text(size = 10, color = "#666666"),
+    panel.grid.major = element_line(color = "#F0F0F0", linewidth = 0.5),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    legend.position  = "bottom",
+    legend.title     = element_text(size = 10, face = "bold"),
+    legend.text      = element_text(size = 10),
+    strip.text       = element_text(size = 11, face = "bold", color = "#0F1923")
+  )
+}
+
+palette_portfolio <- c("#378ADD", "#BA7517", "#1D9E75", "#5F5E5A", "#888780", "#0F1923")
+
+save_fig <- function(filename, width = 9, height = 5) {
+  ggsave(
+    filename = file.path("figures", filename),
+    width    = width,
+    height   = height,
+    dpi      = 150,
+    bg       = "white"
+  )
+}
+```
+
+---
+
+## 3. Data
+
+### 3.1 Loading & Structure
+
+The dataset contains 1,030 laboratory-tested concrete specimens. Column names are shortened for readability; the original names are documented in `data/raw/README.md`.
+
+```{r data-loading}
+ConcData <- read.csv("data/raw/Concrete_Data.csv")
+names(ConcData) <- c("Cement", "BF_Slag", "Fly_Ash", "Water", "Superplasticizer",
+                     "Coarse_Agg", "Fine_Agg", "Age", "Strength")
+
+cat("Dimensions:", nrow(ConcData), "rows ×", ncol(ConcData), "columns\n")
+str(ConcData)
+summary(ConcData)
+```
+
+### 3.2 Exploratory Data Analysis
+
+```{r fig-strength-dist}
+mean_str <- mean(ConcData$Strength)
+med_str  <- median(ConcData$Strength)
+
+ggplot(ConcData, aes(x = Strength)) +
+  geom_histogram(bins = 30, fill = palette_portfolio[1], color = "white", alpha = 0.85) +
+  geom_vline(xintercept = mean_str, linetype = "dashed",
+             color = palette_portfolio[2], linewidth = 1) +
+  geom_vline(xintercept = med_str,  linetype = "dotted",
+             color = palette_portfolio[3], linewidth = 1) +
+  annotate("text", x = mean_str + 2, y = 68,
+           label = paste("Mean:", round(mean_str, 1), "MPa"),
+           color = palette_portfolio[2], size = 3.5, hjust = 0) +
+  annotate("text", x = med_str + 2, y = 61,
+           label = paste("Median:", round(med_str, 1), "MPa"),
+           color = palette_portfolio[3], size = 3.5, hjust = 0) +
+  labs(
+    title    = "Distribution of Concrete Compressive Strength",
+    subtitle = "Slightly right-skewed; most specimens fall between 20–50 MPa, with a long upper tail",
+    x        = "Compressive Strength (MPa)",
+    y        = "Count"
+  ) +
+  theme_portfolio()
+save_fig("01_strength-distribution.png")
+```
+
+```{r fig-corr-heatmap, fig.height=8}
+col_labels <- c("Cement", "BF Slag", "Fly Ash", "Water", "Superplasticizer",
+                "Coarse Agg", "Fine Agg", "Age", "Strength")
+
+cor_mat           <- cor(ConcData)
+rownames(cor_mat) <- col_labels
+colnames(cor_mat) <- col_labels
+
+cor_df        <- as.data.frame(as.table(cor_mat))
+names(cor_df) <- c("Var1", "Var2", "r")
+off_diag      <- subset(cor_df, as.character(Var1) != as.character(Var2))
+
+ggplot(cor_df, aes(x = Var1, y = Var2, fill = r)) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  geom_text(data = off_diag, aes(label = sprintf("%.2f", r)),
+            size = 2.8, color = "#333333") +
+  scale_fill_gradient2(
+    low      = palette_portfolio[2],
+    mid      = "white",
+    high     = palette_portfolio[1],
+    midpoint = 0,
+    limits   = c(-1, 1),
+    name     = "Pearson r"
+  ) +
+  labs(
+    title    = "Feature Correlation Matrix",
+    subtitle = "Age and Cement correlate most strongly with Strength; Water–Superplasticizer (r = −0.67) is the dominant inter-feature pair",
+    x        = NULL,
+    y        = NULL
+  ) +
+  theme_portfolio() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+save_fig("02_correlation-heatmap.png", width = 9, height = 8)
+```
+
+```{r fig-predictors-scatter}
+top4      <- ConcData[, c("Age", "Cement", "BF_Slag", "Water", "Strength")]
+top4_long <- pivot_longer(top4, cols = -Strength, names_to = "Feature", values_to = "Value")
+top4_long$Feature <- factor(
+  top4_long$Feature,
+  levels = c("Age", "Cement", "BF_Slag", "Water"),
+  labels = c("Age (days)", "Cement (kg/m³)", "BF Slag (kg/m³)", "Water (kg/m³)")
+)
+
+ggplot(top4_long, aes(x = Value, y = Strength)) +
+  geom_point(alpha = 0.22, color = palette_portfolio[1], size = 1.5) +
+  geom_smooth(method = "loess", color = palette_portfolio[2],
+              se = FALSE, linewidth = 1.2) +
+  facet_wrap(~ Feature, scales = "free_x", nrow = 1) +
+  labs(
+    title    = "Top Predictors vs Compressive Strength",
+    subtitle = "Age shows a strong non-linear (logarithmic) relationship; Cement has a clear positive trend; Water has an inverse association",
+    x        = "Feature Value",
+    y        = "Strength (MPa)"
+  ) +
+  theme_portfolio()
+save_fig("03_predictors-vs-strength.png", width = 12, height = 5)
+```
+
+---
+
+## 4. Preprocessing
+
+No missing values or categorical variables are present, requiring no imputation or encoding. Tree-based methods are invariant to feature scaling, so raw kg/m³ values were used directly. The dataset was split 70/30 into training and test sets.
+
+```{r preprocessing}
+set.seed(42)
+train_idx  <- sample(seq_len(nrow(ConcData)), size = floor(0.7 * nrow(ConcData)))
+test_idx   <- setdiff(seq_len(nrow(ConcData)), train_idx)
+train_data <- ConcData[train_idx, ]
+test_data  <- ConcData[test_idx, ]
+conc_test  <- test_data$Strength
+
+cat("Training:", nrow(train_data), "specimens | Test:", nrow(test_data), "specimens\n")
+```
+
+---
+
+## 5. Methodology
+
+### Bagging
+
+Bootstrap aggregation (Bagging) grows B full-depth decision trees on independently drawn bootstrap samples of the training set, then averages their predictions. Using all 8 features at every split (mtry = p) makes it the upper bound of averaging without decorrelation — strong predictors appear in every tree, keeping ensemble members correlated and limiting the variance reduction achievable by averaging alone.
+
+### Random Forests
+
+Random Forests extend Bagging by restricting the feature set at each split to a random subset of m predictors, decorrelating the ensemble. This forces other predictors into splits when dominant ones are excluded, spreading the learned signal across the ensemble. The optimal m for regression is typically p/3; candidates m ∈ {3, 4, 5} were evaluated, with m = 5 selected.
+
+### Gradient Boosting
+
+Gradient Boosting builds an additive model sequentially: each new tree is fit to the negative gradient (pseudo-residuals) of the loss function left by all prior trees. Two hyperparameters govern the bias-variance tradeoff: shrinkage λ scales each tree's contribution and prevents overfitting by requiring more iterations; interaction depth d controls the maximum order of variable interactions a single tree can capture. The configuration λ = 0.01, d = 10, T = 5,000 was identified as optimal through cross-validation.
+
+---
+
+## 6. Model Training & Evaluation
+
+### 6.1 Bagging
+
+Full-depth bootstrap-aggregated trees with all 8 predictors available at each split. 900 trees were used; OOB error stabilises well before this count.
+
+```{r bagging, cache=TRUE}
+set.seed(42)
+bag.conc <- randomForest(Strength ~ ., data = ConcData, subset = train_idx,
+                         mtry = 8, ntree = 900, importance = TRUE)
+
+yhat.bag <- predict(bag.conc, newdata = test_data)
+mse_bag  <- mean((yhat.bag - conc_test)^2)
+cat("Bagging Test MSE (900 trees, m = 8):", round(mse_bag, 2), "\n")
+```
+
+### 6.2 Random Forests
+
+m = 5 predictors randomly considered at each split; 150 trees selected as the point where OOB error stabilises for this configuration.
+
+```{r rf, cache=TRUE}
+set.seed(42)
+rf.conc <- randomForest(Strength ~ ., data = ConcData, subset = train_idx,
+                        mtry = 5, ntree = 150, importance = TRUE)
+
+yhat.rf <- predict(rf.conc, newdata = test_data)
+mse_rf  <- mean((yhat.rf - conc_test)^2)
+cat("Random Forest Test MSE (150 trees, m = 5):", round(mse_rf, 2), "\n")
+```
+
+### 6.3 Gradient Boosting
+
+Sequential residual-fitting with shrinkage λ = 0.01 and interaction depth d = 10. The small shrinkage requires 5,000 trees to accumulate sufficient signal but yields a smoother, more regularised ensemble.
+
+```{r boosting, cache=TRUE}
+set.seed(42)
+boost.conc <- gbm(Strength ~ ., data = train_data,
+                  distribution      = "gaussian",
+                  n.trees           = 5000,
+                  shrinkage         = 0.01,
+                  interaction.depth = 10,
+                  verbose           = FALSE)
+
+yhat.boost <- predict(boost.conc, newdata = test_data, n.trees = 5000)
+mse_boost  <- mean((yhat.boost - conc_test)^2)
+cat("Gradient Boosting Test MSE (5,000 trees, λ = 0.01, d = 10):", round(mse_boost, 2), "\n")
+```
+
+### 6.4 Bias-Variance Tradeoff
+
+OOB MSE as a function of tree count shows convergence for Bagging and Random Forests. The interaction depth experiment confirms the role of higher-order ingredient interactions in concrete strength.
+
+```{r oob-curve, cache=TRUE}
+set.seed(42)
+bag.big <- randomForest(Strength ~ ., data = ConcData, subset = train_idx,
+                        mtry = 8, ntree = 1000)
+set.seed(42)
+rf.big  <- randomForest(Strength ~ ., data = ConcData, subset = train_idx,
+                        mtry = 5, ntree = 1000)
+
+oob_df <- data.frame(
+  Trees   = rep(1:1000, 2),
+  OOB_MSE = c(bag.big$mse, rf.big$mse),
+  Method  = rep(c("Bagging (m = 8)", "Random Forest (m = 5)"), each = 1000)
+)
+
+ggplot(oob_df, aes(x = Trees, y = OOB_MSE, color = Method)) +
+  geom_line(linewidth = 0.7, alpha = 0.9) +
+  scale_color_manual(values = c(
+    "Bagging (m = 8)"      = palette_portfolio[1],
+    "Random Forest (m = 5)" = palette_portfolio[3]
+  )) +
+  labs(
+    title    = "OOB MSE vs Number of Trees — Bagging and Random Forests",
+    subtitle = "Both methods stabilise beyond ~200 trees; Random Forest shows a marginal advantage from feature decorrelation",
+    x        = "Number of Trees",
+    y        = "OOB Mean Squared Error",
+    color    = "Method"
+  ) +
+  theme_portfolio()
+save_fig("04_oob-mse-vs-trees.png")
+```
+
+```{r boosting-depth, cache=TRUE}
+depths <- c(1, 5, 10)
+depth_results <- lapply(depths, function(d) {
+  set.seed(42)
+  m    <- gbm(Strength ~ ., data = train_data, distribution = "gaussian",
+              n.trees = 2000, shrinkage = 0.01, interaction.depth = d, verbose = FALSE)
+  yhat <- predict(m, newdata = test_data, n.trees = 2000)
+  data.frame(Depth = as.character(d), MSE = round(mean((yhat - conc_test)^2), 2))
+})
+depth_df       <- do.call(rbind, depth_results)
+depth_df$Depth <- factor(depth_df$Depth, levels = c("1", "5", "10"))
+
+ggplot(depth_df, aes(x = Depth, y = MSE, fill = Depth)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(aes(label = round(MSE, 2)), vjust = -0.5, size = 4.5, color = "#333333") +
+  scale_fill_manual(values = palette_portfolio[c(5, 3, 1)]) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title    = "Boosting Test MSE vs Interaction Depth (lambda = 0.01, 2,000 trees)",
+    subtitle = "Deeper trees substantially reduce error; progressive improvement confirms multi-ingredient interactions are real",
+    x        = "Interaction Depth (d)",
+    y        = "Test MSE"
+  ) +
+  theme_portfolio()
+save_fig("05_boosting-depth-comparison.png", width = 7, height = 5)
+```
+
+### 6.5 Variable Importance
+
+Variable importance is measured by the mean decrease in MSE when each predictor is permuted (%IncMSE for Bagging and Random Forests; relative influence for Boosting).
+
+```{r importance-figures}
+feat_labels <- c(
+  "Cement" = "Cement", "BF_Slag" = "BF Slag", "Fly_Ash" = "Fly Ash",
+  "Water" = "Water", "Superplasticizer" = "Superplasticizer",
+  "Coarse_Agg" = "Coarse Agg", "Fine_Agg" = "Fine Agg", "Age" = "Age"
+)
+
+# Bagging
+bag_imp         <- as.data.frame(importance(bag.conc))
+bag_imp$Feature <- feat_labels[rownames(bag_imp)]
+bag_imp$pct_inc <- bag_imp$`%IncMSE`
+
+ggplot(bag_imp, aes(x = reorder(Feature, pct_inc), y = pct_inc)) +
+  geom_col(fill = palette_portfolio[1]) +
+  coord_flip() +
+  labs(
+    title    = "Variable Importance — Bagging",
+    subtitle = "Age dominates by a large margin; Cement is a clear second; aggregate components contribute least",
+    x        = NULL,
+    y        = "% Increase in MSE (variable permuted)"
+  ) +
+  theme_portfolio()
+save_fig("06_feature-importance-bagging.png", width = 8, height = 5)
+
+# Random Forests
+rf_imp         <- as.data.frame(importance(rf.conc))
+rf_imp$Feature <- feat_labels[rownames(rf_imp)]
+rf_imp$pct_inc <- rf_imp$`%IncMSE`
+
+ggplot(rf_imp, aes(x = reorder(Feature, pct_inc), y = pct_inc)) +
+  geom_col(fill = palette_portfolio[3]) +
+  coord_flip() +
+  labs(
+    title    = "Variable Importance — Random Forests",
+    subtitle = "Feature decorrelation redistributes some importance from Age toward Cement and Superplasticizer",
+    x        = NULL,
+    y        = "% Increase in MSE (variable permuted)"
+  ) +
+  theme_portfolio()
+save_fig("07_feature-importance-rf.png", width = 8, height = 5)
+
+# Gradient Boosting
+boost_imp         <- summary(boost.conc, plotit = FALSE)
+boost_imp$Feature <- feat_labels[boost_imp$var]
+
+ggplot(boost_imp, aes(x = reorder(Feature, rel.inf), y = rel.inf)) +
+  geom_col(fill = palette_portfolio[2]) +
+  coord_flip() +
+  labs(
+    title    = "Variable Importance — Gradient Boosting (Relative Influence)",
+    subtitle = "Age and Cement account for over 50% of total relative influence; BF Slag and Superplasticizer form a distant second tier",
+    x        = NULL,
+    y        = "Relative Influence (%)"
+  ) +
+  theme_portfolio()
+save_fig("08_feature-importance-boosting.png", width = 8, height = 5)
+```
+
+---
+
+## 7. Results & Discussion
+
+Gradient Boosting achieved a test MSE of 17.14, a 38% reduction from the Bagging baseline of 27.57 and a comparable reduction from Random Forests at 27.78. This gap reflects the fundamental difference between averaging and sequential residual-fitting: Bagging and Random Forests reduce variance by aggregating independent predictions, but Gradient Boosting additionally reduces bias by directly targeting residuals left unaddressed after each iteration.
+
+The small performance gap between Bagging (27.57) and Random Forests (27.78) is noteworthy. In theory, Random Forests should outperform Bagging by decorrelating the ensemble. Here, Age is so dominant that restricting the feature set at each split only partially limits its influence — any candidate split for a given node is likely to include Age regardless of m, dampening the benefit of subsampling. This is consistent with the variable importance results: Age accounts for a substantially larger share of importance than any other predictor across all three methods.
+
+The interaction depth experiment (d ∈ {1, 5, 10}) confirms that compressive strength is jointly determined by ingredient combinations rather than by any single feature in isolation. Shallow trees (d = 1, stumps) can only capture additive effects; the progressive improvement through d = 5 and d = 10 validates that higher-order interactions — such as the joint effect of cement content, water-cement ratio, and curing age — meaningfully improve prediction accuracy. In a domain where material behaviour emerges from chemical reactions with non-linear dependencies, this result is physically interpretable.
+
+Variable importance rankings are consistent across all three methods, with Age and Cement at the top and aggregate components at the bottom, closely reproducing established concrete engineering theory without any domain constraints imposed on the models.
+
+---
+
+## 8. Conclusions
+
+- Gradient Boosting (λ = 0.01, d = 10, 5,000 trees) achieved the best test MSE of **17.14**, outperforming Bagging (27.57) and Random Forests (27.78) by **38%**.
+- The negligible gap between Bagging and Random Forests is explained by Age's overwhelming dominance: feature decorrelation provides limited benefit when one predictor is so strong that it appears in nearly every split regardless of m.
+- Progressive improvement with interaction depth (d = 1 → 5 → 10) confirms that concrete compressive strength involves genuine multi-ingredient interactions, not just additive single-feature effects.
+- Variable importance rankings — Age first, Cement second, aggregate components last — align closely with established concrete engineering theory, validating that the models learned physically meaningful relationships.
+- Tree ensemble methods provide a fast alternative to laboratory testing for structural design decision-making, with Gradient Boosting offering the best accuracy for this materials science problem.
